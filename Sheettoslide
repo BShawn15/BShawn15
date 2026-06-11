@@ -1,0 +1,197 @@
+/**
+ * SHEETS â†’ SLIDES SNAPSHOT REFRESHER (v2)
+ * ---------------------------------------
+ * Adds two upgrades over v1:
+ *   1. MERGED CELLS â€” copies your Sheet's merged ranges into the Slides table
+ *   2. NO GRIDLINES â€” strips all table borders so it looks like a clean view,
+ *      not a default Slides table
+ *
+ * EXTRA SETUP STEP REQUIRED (one time):
+ * In the Apps Script editor, click the "+" next to "Services" in the
+ * left sidebar â†’ choose "Google Slides API" â†’ Add.
+ * (This enables the advanced API needed for merges and border removal.)
+ *
+ * Everything else is the same as before:
+ * 1. Extensions â†’ Apps Script in your Google Sheet
+ * 2. Paste this file, set DECK_ID, configure VIEWS
+ * 3. Save, reload the Sheet, use ðŸ“Š Deck Tools â†’ Refresh Deck
+ */
+
+// ====== CONFIG ======
+
+const DECK_ID = 'PASTE_YOUR_SLIDES_ID_HERE';
+
+const VIEWS = [
+  { range: 'Customer View 1!A1:F20', slide: 2, tag: 'view-1', left: 30, top: 60 },
+  { range: 'Customer View 2!A1:H15', slide: 3, tag: 'view-2', left: 30, top: 60 },
+  // add more views here...
+];
+
+// ====== MENU ======
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+    .createMenu('ðŸ“Š Deck Tools')
+    .addItem('Refresh Deck', 'refreshDeck')
+    .addToUi();
+}
+
+// ====== MAIN ======
+
+function refreshDeck() {
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const deck = SlidesApp.openById(DECK_ID);
+  const slides = deck.getSlides();
+  const errors = [];
+  const postRequests = []; // advanced API requests (merges + border removal)
+
+  VIEWS.forEach(view => {
+    try {
+      const range = ss.getRange(view.range);
+      const slide = slides[view.slide - 1];
+      if (!slide) throw new Error('Slide ' + view.slide + ' does not exist in the deck.');
+
+      removeOldView_(slide, view.tag);
+      const tableId = buildTable_(slide, range, view);
+
+      // Queue gridline removal for this table
+      postRequests.push(borderRemovalRequest_(tableId));
+
+      // Queue merge requests matching the Sheet's merged ranges
+      mergeRequests_(range, tableId).forEach(r => postRequests.push(r));
+    } catch (e) {
+      errors.push(view.tag + ': ' + e.message);
+    }
+  });
+
+  // Commit the SlidesApp changes BEFORE running advanced API requests
+  deck.saveAndClose();
+
+  if (postRequests.length) {
+    Slides.Presentations.batchUpdate({ requests: postRequests }, DECK_ID);
+  }
+
+  const ui = SpreadsheetApp.getUi();
+  if (errors.length) {
+    ui.alert('Deck refreshed with issues:\n\n' + errors.join('\n'));
+  } else {
+    ui.alert('âœ… Deck refreshed! ' + VIEWS.length + ' view(s) updated.');
+  }
+}
+
+// ====== BUILDERS ======
+
+function removeOldView_(slide, tag) {
+  slide.getTables().forEach(t => {
+    if (t.getDescription() === tag) t.remove();
+  });
+}
+
+/** Rebuilds the range as a Slides table; returns the table's objectId. */
+function buildTable_(slide, range, view) {
+  const numRows = range.getNumRows();
+  const numCols = range.getNumColumns();
+
+  const values  = range.getDisplayValues();
+  const bgs     = range.getBackgrounds();
+  const fColors = range.getFontColors();
+  const fSizes  = range.getFontSizes();
+  const weights = range.getFontWeights();
+  const styles  = range.getFontStyles();
+  const aligns  = range.getHorizontalAlignments();
+
+  const table = slide.insertTable(numRows, numCols);
+  table.setDescription(view.tag);
+  table.setLeft(view.left != null ? view.left : 30);
+  table.setTop(view.top != null ? view.top : 60);
+
+  for (let r = 0; r < numRows; r++) {
+    for (let c = 0; c < numCols; c++) {
+      const cell = table.getCell(r, c);
+      cell.setContentAlignment(SlidesApp.ContentAlignment.MIDDLE);
+
+      const textRange = cell.getText();
+      const val = values[r][c];
+      if (val !== '') textRange.setText(val);
+
+      const style = textRange.getTextStyle();
+      style.setForegroundColor(fColors[r][c] || '#000000');
+      style.setFontSize(view.fontSize || fSizes[r][c] || 10);
+      style.setBold(weights[r][c] === 'bold');
+      style.setItalic(styles[r][c] === 'italic');
+
+      const bg = bgs[r][c];
+      if (bg && bg.toLowerCase() !== '#ffffff') {
+        cell.getFill().setSolidFill(bg);
+      }
+
+      const para = textRange.getParagraphStyle();
+      const a = aligns[r][c];
+      if (a === 'right' || a === 'general-right') {
+        para.setParagraphAlignment(SlidesApp.ParagraphAlignment.END);
+      } else if (a === 'center' || a === 'general-center') {
+        para.setParagraphAlignment(SlidesApp.ParagraphAlignment.CENTER);
+      } else {
+        para.setParagraphAlignment(SlidesApp.ParagraphAlignment.START);
+      }
+    }
+  }
+
+  return table.getObjectId();
+}
+
+// ====== ADVANCED API REQUESTS ======
+
+/** Makes every border in the table fully transparent (no gridlines). */
+function borderRemovalRequest_(tableId) {
+  return {
+    updateTableBorderProperties: {
+      objectId: tableId,
+      borderPosition: 'ALL',
+      tableBorderProperties: {
+        tableBorderFill: {
+          solidFill: {
+            color: { rgbColor: { red: 1, green: 1, blue: 1 } },
+            alpha: 0
+          }
+        }
+      },
+      fields: 'tableBorderFill'
+    }
+  };
+}
+
+/** Builds mergeTableCells requests matching the Sheet's merged ranges. */
+function mergeRequests_(range, tableId) {
+  const startRow = range.getRow();
+  const startCol = range.getColumn();
+  const numRows = range.getNumRows();
+  const numCols = range.getNumColumns();
+  const requests = [];
+
+  range.getMergedRanges().forEach(m => {
+    // Position of the merge relative to the view's top-left corner
+    const rOff = m.getRow() - startRow;
+    const cOff = m.getColumn() - startCol;
+
+    // Clip to the view's bounds (in case a merge extends past the range)
+    const rowSpan = Math.min(m.getNumRows(), numRows - rOff);
+    const colSpan = Math.min(m.getNumColumns(), numCols - cOff);
+
+    if (rOff < 0 || cOff < 0 || rowSpan < 1 || colSpan < 1) return;
+    if (rowSpan === 1 && colSpan === 1) return;
+
+    requests.push({
+      mergeTableCells: {
+        objectId: tableId,
+        tableRange: {
+          location: { rowIndex: rOff, columnIndex: cOff },
+          rowSpan: rowSpan,
+          columnSpan: colSpan
+        }
+      }
+    });
+  });
+
+  return requests;
+}
